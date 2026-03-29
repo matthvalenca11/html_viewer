@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -6,6 +8,44 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:path/path.dart' as p;
 
 import 'local_html_path.dart';
+
+/// Largura lógica “desktop” para viewport (CSS / media queries), alinhada a ~iPad horizontal.
+const int _kDesktopViewportWidth = 1280;
+
+/// User-Agent de desktop (Chrome/macOS) para páginas que decidem layout pelo UA.
+const String _kDesktopUserAgent =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/// Injeta/substitui meta viewport antes do layout, para não cair no modo “mobile estreito”.
+final String _kDesktopViewportUserScriptSource = '''
+(function() {
+  var w = '$_kDesktopViewportWidth';
+  var content = 'width=' + w + ', initial-scale=1, shrink-to-fit=no, maximum-scale=5, user-scalable=yes, viewport-fit=cover';
+  function patch() {
+    try {
+      var m = document.querySelector('meta[name="viewport"]');
+      if (m) {
+        m.setAttribute('content', content);
+      } else if (document.head) {
+        m = document.createElement('meta');
+        m.setAttribute('name', 'viewport');
+        m.setAttribute('content', content);
+        document.head.insertBefore(m, document.head.firstChild);
+      }
+    } catch (e) {}
+  }
+  patch();
+  document.addEventListener('readystatechange', function() {
+    if (document.readyState === 'interactive' || document.readyState === 'complete') patch();
+  });
+})();
+''';
+
+final UserScript _kDesktopViewportUserScript = UserScript(
+  source: _kDesktopViewportUserScriptSource,
+  injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+  groupName: 'desktop_viewport',
+);
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -115,7 +155,14 @@ class _HtmlViewerPageState extends State<HtmlViewerPage> {
   /// iOS: `transparentBackground: true` often leaves WKWebView visually blank.
   /// `allowingReadAccessTo` must be set on [InAppWebViewSettings] when using
   /// [initialUrlRequest] with `file://` (see plugin docs).
-  InAppWebViewSettings _settingsFor(String readAccessDir) => InAppWebViewSettings(
+  ///
+  /// Em telefones (menor lado abaixo de 600): UA + viewport “desktop” e Android sem
+  /// zoom-out automático — layout como navegador/iPad. Tablets não são alterados.
+  InAppWebViewSettings _settingsFor(
+    String readAccessDir, {
+    required bool usePhoneDesktopLayout,
+  }) =>
+      InAppWebViewSettings(
         javaScriptEnabled: true,
         domStorageEnabled: true,
         allowFileAccessFromFileURLs: true,
@@ -126,6 +173,10 @@ class _HtmlViewerPageState extends State<HtmlViewerPage> {
         allowContentAccess: true,
         hardwareAcceleration: true,
         allowingReadAccessTo: WebUri.uri(Uri.directory(readAccessDir)),
+        userAgent: usePhoneDesktopLayout ? _kDesktopUserAgent : '',
+        // Android: não encolher a página inteira à largura do ecrã (comportamento “overview”).
+        useWideViewPort: true,
+        loadWithOverviewMode: usePhoneDesktopLayout ? false : true,
       );
 
   @override
@@ -153,12 +204,20 @@ class _HtmlViewerPageState extends State<HtmlViewerPage> {
     final filePath = widget.fileAbsolutePath;
     final readAccessDir = p.dirname(filePath);
     final fileUri = WebUri.uri(Uri.file(filePath));
+    final shortest = MediaQuery.sizeOf(context).shortestSide;
+    final usePhoneDesktopLayout = shortest < 600;
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: SizedBox.expand(
         child: InAppWebView(
-          initialSettings: _settingsFor(readAccessDir),
+          initialSettings: _settingsFor(
+            readAccessDir,
+            usePhoneDesktopLayout: usePhoneDesktopLayout,
+          ),
+          initialUserScripts: usePhoneDesktopLayout
+              ? UnmodifiableListView<UserScript>([_kDesktopViewportUserScript])
+              : null,
           initialUrlRequest: URLRequest(url: fileUri),
           onDownloadStartRequest: (_, __) async {},
           onReceivedError: (controller, request, error) {
