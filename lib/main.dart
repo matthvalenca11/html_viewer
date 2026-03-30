@@ -300,6 +300,13 @@ class _FullScreenWebViewerPageState extends State<FullScreenWebViewerPage> {
 
   InAppWebViewController? _controller;
   double _edgeDragAccumDx = 0;
+  double _topDragAccumDy = 0;
+  bool _hardReloadInProgress = false;
+
+  /// Faixa na parte de cima para detectar "puxar para atualizar" sem roubar
+  /// todos os toques do conteúdo da página.
+  static const double _kPullToRefreshEdgeHeight = 64;
+  static const double _kPullToRefreshTriggerDy = 72;
 
   /// Volta no histórico da WebView; se não houver, fecha o viewer (home).
   Future<void> _handleNavigateBack() async {
@@ -316,11 +323,77 @@ class _FullScreenWebViewerPageState extends State<FullScreenWebViewerPage> {
   /// Tela inteira não recebe o gesto para não roubar toques da página.
   static const double _kBackGestureEdgeWidth = 48;
 
-  Widget _wrapRemoteWithEdgeBackGesture(Widget webView) {
+  Future<bool> _isWebViewAtTop() async {
+    final c = _controller;
+    if (c == null) return true;
+
+    try {
+      // Usa scrollY/documentElement para cobrir a maioria dos casos.
+      final value = await c.evaluateJavascript(
+        source: '(window.scrollY || document.documentElement.scrollTop || 0)',
+      );
+      final numValue = (value is num) ? value : num.tryParse('$value');
+      if (numValue == null) return true;
+      return numValue <= 4;
+    } catch (_) {
+      // Se falhar, não bloqueia UX: deixa o refresh acontecer.
+      return true;
+    }
+  }
+
+  Future<void> _hardReload() async {
+    if (_hardReloadInProgress) return;
+    final c = _controller;
+    if (c == null) return;
+
+    _hardReloadInProgress = true;
+    try {
+      // Equivalente ao "refresh" do navegador; o plugin trata internamente o reload.
+      await c.reload();
+    } finally {
+      _hardReloadInProgress = false;
+    }
+  }
+
+  Widget _wrapWebViewWithTopPullToRefresh(Widget webView) {
     return Stack(
       fit: StackFit.expand,
       children: [
         webView,
+        Positioned(
+          left: 0,
+          top: 0,
+          right: 0,
+          height: _kPullToRefreshEdgeHeight,
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onVerticalDragStart: (_) => _topDragAccumDy = 0,
+            onVerticalDragUpdate: (details) {
+              // Só acumulamos puxadas para baixo.
+              if (details.delta.dy > 0) {
+                _topDragAccumDy += details.delta.dy;
+              }
+            },
+            onVerticalDragEnd: (details) async {
+              final wentDown = _topDragAccumDy > _kPullToRefreshTriggerDy;
+              _topDragAccumDy = 0;
+              if (!wentDown || !mounted) return;
+              if (await _isWebViewAtTop()) {
+                await _hardReload();
+              }
+            },
+            onVerticalDragCancel: () => _topDragAccumDy = 0,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _wrapRemoteWithEdgeBackGesture(Widget webView) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        _wrapWebViewWithTopPullToRefresh(webView),
         Positioned(
           left: 0,
           top: 0,
@@ -428,13 +501,15 @@ class _FullScreenWebViewerPageState extends State<FullScreenWebViewerPage> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: SizedBox.expand(
-        child: _buildWebView(
+        child: _wrapWebViewWithTopPullToRefresh(
+          _buildWebView(
           settings: _settingsFor(
             readAccessDir,
             usePhoneDesktopLayout: usePhoneDesktopLayout,
           ),
           initialRequest: URLRequest(url: fileUri),
           userScripts: userScripts,
+          ),
         ),
       ),
     );
