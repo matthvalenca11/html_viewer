@@ -381,14 +381,9 @@ class _FullScreenWebViewerPageState extends State<FullScreenWebViewerPage> {
       },
       onDownloadStartRequest: (_, __) async {},
       onReceivedError: (controller, request, error) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Erro ao carregar página: ${error.description}',
-            ),
-          ),
-        );
+        // Alguns redirecionamentos podem gerar `NSURLErrorDomain error -999`
+        // mesmo com o destino carregando normalmente. Não exibimos popup
+        // porque não ajuda na UX.
       },
     );
   }
