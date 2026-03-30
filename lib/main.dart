@@ -78,6 +78,44 @@ class OpenFilePage extends StatefulWidget {
 
 class _OpenFilePageState extends State<OpenFilePage> {
   bool _busy = false;
+  final TextEditingController _urlController = TextEditingController();
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    super.dispose();
+  }
+
+  WebUri? _parseUserUrl(String raw) {
+    var s = raw.trim();
+    if (s.isEmpty) return null;
+    if (!s.contains('://')) {
+      s = 'https://$s';
+    }
+    final uri = Uri.tryParse(s);
+    if (uri == null || !uri.hasScheme) return null;
+    final scheme = uri.scheme.toLowerCase();
+    if (scheme != 'http' && scheme != 'https') return null;
+    if (uri.host.isEmpty) return null;
+    return WebUri(uri.toString());
+  }
+
+  void _openUrl() {
+    if (kIsWeb) {
+      _toast('Disponível apenas em iOS, iPadOS e Android.');
+      return;
+    }
+    final webUri = _parseUserUrl(_urlController.text);
+    if (webUri == null) {
+      _toast('Digite um endereço válido (ex.: exemplo.com ou https://…).');
+      return;
+    }
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (context) => FullScreenWebViewerPage.url(webUri),
+      ),
+    );
+  }
 
   Future<void> _pickAndOpen() async {
     if (kIsWeb) {
@@ -109,7 +147,7 @@ class _OpenFilePageState extends State<OpenFilePage> {
       }
       await Navigator.of(context).pushReplacement(
         MaterialPageRoute<void>(
-          builder: (context) => HtmlViewerPage(fileAbsolutePath: path),
+          builder: (context) => FullScreenWebViewerPage.file(path),
         ),
       );
     } finally {
@@ -128,30 +166,97 @@ class _OpenFilePageState extends State<OpenFilePage> {
   @override
   Widget build(BuildContext context) {
     final surface = Theme.of(context).colorScheme.surface;
+    final padding = MediaQuery.paddingOf(context);
     return Scaffold(
       backgroundColor: surface,
-      body: Center(
+      body: SafeArea(
         child: _busy
-            ? const CircularProgressIndicator()
-            : FilledButton(
-                onPressed: _pickAndOpen,
-                child: const Text('Abrir Arquivo'),
+            ? const Center(child: CircularProgressIndicator())
+            : SingleChildScrollView(
+                padding: const EdgeInsets.all(24),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    minHeight: MediaQuery.sizeOf(context).height -
+                        padding.vertical -
+                        48,
+                  ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      FilledButton(
+                        onPressed: _pickAndOpen,
+                        child: const Text('Abrir arquivo HTML'),
+                      ),
+                      const SizedBox(height: 32),
+                      Row(
+                        children: [
+                          Expanded(child: Divider(color: surface)),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 12),
+                            child: Text(
+                              'ou abrir um site',
+                              style: Theme.of(context).textTheme.labelLarge,
+                            ),
+                          ),
+                          Expanded(child: Divider(color: surface)),
+                        ],
+                      ),
+                      const SizedBox(height: 16),
+                      TextField(
+                        controller: _urlController,
+                        keyboardType: TextInputType.url,
+                        autocorrect: false,
+                        textInputAction: TextInputAction.go,
+                        onSubmitted: (_) => _openUrl(),
+                        decoration: const InputDecoration(
+                          border: OutlineInputBorder(),
+                          hintText: 'https://exemplo.com',
+                          labelText: 'Endereço do site',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      FilledButton.tonal(
+                        onPressed: _openUrl,
+                        child: const Text('Abrir link'),
+                      ),
+                    ],
+                  ),
+                ),
               ),
       ),
     );
   }
 }
 
-class HtmlViewerPage extends StatefulWidget {
-  const HtmlViewerPage({super.key, required this.fileAbsolutePath});
+/// Visualização em tela inteira: arquivo local [file] ou página remota [url].
+class FullScreenWebViewerPage extends StatefulWidget {
+  FullScreenWebViewerPage._({
+    this.fileAbsolutePath,
+    this.initialWebUri,
+  })  : assert(
+          (fileAbsolutePath != null) ^ (initialWebUri != null),
+          'Informe arquivo ou URL.',
+        ),
+        super();
 
-  final String fileAbsolutePath;
+  factory FullScreenWebViewerPage.file(String fileAbsolutePath) {
+    return FullScreenWebViewerPage._(fileAbsolutePath: fileAbsolutePath);
+  }
+
+  factory FullScreenWebViewerPage.url(WebUri initialWebUri) {
+    return FullScreenWebViewerPage._(initialWebUri: initialWebUri);
+  }
+
+  final String? fileAbsolutePath;
+  final WebUri? initialWebUri;
 
   @override
-  State<HtmlViewerPage> createState() => _HtmlViewerPageState();
+  State<FullScreenWebViewerPage> createState() =>
+      _FullScreenWebViewerPageState();
 }
 
-class _HtmlViewerPageState extends State<HtmlViewerPage> {
+class _FullScreenWebViewerPageState extends State<FullScreenWebViewerPage> {
   /// iOS: `transparentBackground: true` often leaves WKWebView visually blank.
   /// `allowingReadAccessTo` must be set on [InAppWebViewSettings] when using
   /// [initialUrlRequest] with `file://` (see plugin docs).
@@ -179,6 +284,69 @@ class _HtmlViewerPageState extends State<HtmlViewerPage> {
         loadWithOverviewMode: usePhoneDesktopLayout ? false : true,
       );
 
+  InAppWebViewSettings _settingsForRemote({
+    required bool usePhoneDesktopLayout,
+  }) =>
+      InAppWebViewSettings(
+        javaScriptEnabled: true,
+        domStorageEnabled: true,
+        useOnDownloadStart: true,
+        transparentBackground: false,
+        hardwareAcceleration: true,
+        userAgent: usePhoneDesktopLayout ? _kDesktopUserAgent : '',
+        useWideViewPort: true,
+        loadWithOverviewMode: usePhoneDesktopLayout ? false : true,
+      );
+
+  InAppWebViewController? _controller;
+  double _edgeDragAccumDx = 0;
+
+  /// Volta no histórico da WebView; se não houver, fecha o viewer (home).
+  Future<void> _handleNavigateBack() async {
+    if (!mounted) return;
+    final c = _controller;
+    if (c != null && await c.canGoBack()) {
+      await c.goBack();
+    } else if (mounted) {
+      Navigator.of(context).pop();
+    }
+  }
+
+  /// Faixa invisível na borda esquerda: arrastar para a direita = voltar (histórico ou sair).
+  /// Tela inteira não recebe o gesto para não roubar toques da página.
+  static const double _kBackGestureEdgeWidth = 48;
+
+  Widget _wrapRemoteWithEdgeBackGesture(Widget webView) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        webView,
+        Positioned(
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: _kBackGestureEdgeWidth,
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onHorizontalDragStart: (_) => _edgeDragAccumDx = 0,
+            onHorizontalDragUpdate: (details) {
+              _edgeDragAccumDx += details.delta.dx;
+            },
+            onHorizontalDragEnd: (details) async {
+              final vx = details.primaryVelocity ?? 0;
+              final wentRight = _edgeDragAccumDx > 56 ||
+                  (vx > 220 && _edgeDragAccumDx > 6);
+              _edgeDragAccumDx = 0;
+              if (!wentRight || !mounted) return;
+              await _handleNavigateBack();
+            },
+            onHorizontalDragCancel: () => _edgeDragAccumDx = 0,
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -199,37 +367,79 @@ class _HtmlViewerPageState extends State<HtmlViewerPage> {
     super.dispose();
   }
 
+  Widget _buildWebView({
+    required InAppWebViewSettings settings,
+    required URLRequest initialRequest,
+    UnmodifiableListView<UserScript>? userScripts,
+  }) {
+    return InAppWebView(
+      initialSettings: settings,
+      initialUserScripts: userScripts,
+      initialUrlRequest: initialRequest,
+      onWebViewCreated: (controller) {
+        _controller = controller;
+      },
+      onDownloadStartRequest: (_, __) async {},
+      onReceivedError: (controller, request, error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Erro ao carregar página: ${error.description}',
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final filePath = widget.fileAbsolutePath;
-    final readAccessDir = p.dirname(filePath);
-    final fileUri = WebUri.uri(Uri.file(filePath));
     final shortest = MediaQuery.sizeOf(context).shortestSide;
     final usePhoneDesktopLayout = shortest < 600;
+    final userScripts = usePhoneDesktopLayout
+        ? UnmodifiableListView<UserScript>([_kDesktopViewportUserScript])
+        : null;
+
+    if (widget.initialWebUri != null) {
+      final remoteUri = widget.initialWebUri!;
+      final webView = _buildWebView(
+        settings: _settingsForRemote(
+          usePhoneDesktopLayout: usePhoneDesktopLayout,
+        ),
+        initialRequest: URLRequest(url: remoteUri),
+        userScripts: userScripts,
+      );
+
+      return PopScope(
+        canPop: false,
+        onPopInvokedWithResult: (didPop, result) async {
+          if (didPop) return;
+          await _handleNavigateBack();
+        },
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: SizedBox.expand(
+            child: _wrapRemoteWithEdgeBackGesture(webView),
+          ),
+        ),
+      );
+    }
+
+    final filePath = widget.fileAbsolutePath!;
+    final readAccessDir = p.dirname(filePath);
+    final fileUri = WebUri.uri(Uri.file(filePath));
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: SizedBox.expand(
-        child: InAppWebView(
-          initialSettings: _settingsFor(
+        child: _buildWebView(
+          settings: _settingsFor(
             readAccessDir,
             usePhoneDesktopLayout: usePhoneDesktopLayout,
           ),
-          initialUserScripts: usePhoneDesktopLayout
-              ? UnmodifiableListView<UserScript>([_kDesktopViewportUserScript])
-              : null,
-          initialUrlRequest: URLRequest(url: fileUri),
-          onDownloadStartRequest: (_, __) async {},
-          onReceivedError: (controller, request, error) {
-            if (!mounted) return;
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text(
-                  'Erro ao carregar página: ${error.description}',
-                ),
-              ),
-            );
-          },
+          initialRequest: URLRequest(url: fileUri),
+          userScripts: userScripts,
         ),
       ),
     );
